@@ -1,4 +1,12 @@
+attrs
+beautifulsoup4
 click<6.7
+lxml
+pip<10
+requests
+semantic-version
 thoth-analyzer
 thoth-common
+thoth-solver
 thoth-storages
+toml
