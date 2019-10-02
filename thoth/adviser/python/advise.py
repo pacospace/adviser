@@ -19,42 +19,23 @@
 """Recommendation engine based on scoring of a software stack."""
 
 import logging
-import heapq
-import typing
+from typing import List
+from typing import Tuple
+from typing import Dict
 
 import attr
 
 from thoth.common import RuntimeEnvironment
 from thoth.python import Project
-from thoth.adviser.python import DependencyGraph
 from thoth.adviser.enums import RecommendationType
-from thoth.adviser.python.helpers import fill_package_digests_from_graph
 from thoth.storages import GraphDatabase
 
-from .scoring import Scoring
+from .builder import PipelineBuilder
+from .builder import PipelineConfig
+from .pipeline import Pipeline
 
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class HeapEntry:
-    """An advise with score stored on heap."""
-
-    __slots__ = ["score", "reasoning", "generated_project"]
-
-    def __init__(self, score: float, reasoning: list, generated_project: Project):
-        """Initialize heap entry item."""
-        self.score = score
-        self.reasoning = reasoning
-        self.generated_project = generated_project
-
-    def __gt__(self, other):
-        """Compare heap entries based on score."""
-        return self.score > other.score
-
-    def get_entries(self) -> tuple:
-        """Get heap entry items."""
-        return self.reasoning, self.generated_project
 
 
 @attr.s(slots=True)
@@ -69,87 +50,85 @@ class Adviser:
     _computed_stacks_heap = attr.ib(type=RuntimeEnvironment, default=attr.Factory(list))
     _visited = attr.ib(type=int, default=0)
 
+    def compute_using_pipeline(self, pipeline: Pipeline) -> Tuple[List[Tuple[Dict, Project, float]], List[Dict]]:
+        """Compute recommendations using a custom pipeline configuration."""
+        result = []
+        for product in pipeline.conduct(count=self.count, limit=self.limit):
+            product.finalize()
+            result.append((product.justification, product.project, product.score))
+
+        return result, pipeline.get_stack_info()
+
     def compute(
         self,
         graph: GraphDatabase,
         project: Project,
-        runtime_environment: RuntimeEnvironment,
-        scoring_function: typing.Callable,
-        dry_run: bool = False,
-    ) -> typing.Union[typing.List[Project], int]:
+        limit_latest_versions: int = None,
+        library_usage: dict = None,
+    ) -> Tuple[Tuple[List[Tuple[Dict, Project, float]], List[Dict]], Dict]:
         """Compute recommendations for the given project."""
-        dependency_graph = DependencyGraph.from_project(graph, project, runtime_environment, restrict_indexes=False)
+        builder = PipelineBuilder(graph, project, library_usage)
+        pipeline_config: PipelineConfig = builder.get_adviser_pipeline_config(
+            self.recommendation_type, limit_latest_versions=limit_latest_versions
+        )
+        pipeline = Pipeline(
+            sieves=pipeline_config.sieves,
+            steps=pipeline_config.steps,
+            strides=pipeline_config.strides,
+            graph=graph,
+            project=project,
+            library_usage=library_usage,
+        )
 
-        try:
-            for decision_function_result, generated_project in dependency_graph.walk(
-                scoring_function
-            ):
-                score, reasoning = decision_function_result
-                reasoning.append({'score': score})
-                self._visited += 1
-
-                if dry_run:
-                    continue
-
-                heap_entry = HeapEntry(score, reasoning, generated_project)
-                if (
-                    self.count is not None
-                    and len(self._computed_stacks_heap) >= self.count
-                ):
-                    heapq.heappushpop(self._computed_stacks_heap, heap_entry)
-                else:
-                    heapq.heappush(self._computed_stacks_heap, heap_entry)
-
-                if self.limit is not None and self._visited >= self.limit:
-                    _LOGGER.info("Reached graph traversal limit (%s), stopping dependency graph traversal", self.limit)
-                    break
-
-            if dry_run:
-                return self._visited
-
-            _LOGGER.info("Scored %d stacks in total", self._visited)
-            # Sort computed stacks based on score and return them.
-            # TODO: heap pop (?)
-            result = (
-                item.get_entries()
-                for item in sorted(self._computed_stacks_heap, reverse=True)
-            )
-            _LOGGER.info("Filling package digests to software stacks")
-            result = [
-                (item[0], fill_package_digests_from_graph(item[1], graph)) for item in result
-            ]
-            return result
-        finally:
-            self._computed_stacks_heap = []
-            self._visited = 0
+        return self.compute_using_pipeline(pipeline), pipeline.get_configuration()
 
     @classmethod
     def compute_on_project(
         cls,
         project: Project,
         *,
-        runtime_environment: RuntimeEnvironment,
         recommendation_type: RecommendationType,
+        library_usage: dict = None,
         count: int = None,
         limit: int = None,
-        dry_run: bool = False
+        limit_latest_versions: int = None,
+        graph: GraphDatabase = None,
     ) -> tuple:
         """Compute recommendations for the given project, a syntax sugar for the compute method."""
-        instance = cls(count=count, limit=limit, recommendation_type=recommendation_type)
+        stack_info = []
 
-        graph = GraphDatabase()
-        graph.connect()
-
-        scoring = Scoring(
-            graph=graph,
-            runtime_environment=runtime_environment,
-            python_version=project.python_version,
+        instance = cls(
+            count=count, limit=limit, recommendation_type=recommendation_type
         )
-        report = instance.compute(
+
+        if project.runtime_environment.python_version and not project.python_version:
+            stack_info.append(
+                {
+                    "type": "WARNING",
+                    "justification": "Use specific Python version in Pipfile based on Thoth's configuration to "
+                    "ensure correct Python version usage on deployment",
+                }
+            )
+            project.set_python_version(project.runtime_environment.python_version)
+
+        if not graph:
+            graph = GraphDatabase()
+            graph.connect()
+
+        result, pipeline_configuration = instance.compute(
             graph,
             project,
-            runtime_environment,
-            scoring.get_scoring_function(recommendation_type),
-            dry_run=dry_run
+            limit_latest_versions=limit_latest_versions,
+            library_usage=library_usage,
         )
-        return scoring.get_stack_info(), report
+
+        report, stack_info = result
+        advised_configuration = None
+        configuration_check_report = project.get_configuration_check_report()
+        if configuration_check_report:
+            advised_configuration, configuration_check_report = (
+                configuration_check_report
+            )
+            stack_info.extend(configuration_check_report)
+
+        return stack_info, advised_configuration, report, pipeline_configuration

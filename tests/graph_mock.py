@@ -32,7 +32,7 @@ class MockedGraphDatabase:
         with open(
             os.path.join(AdviserTestCase.data_dir, "graph", database_file), "r"
         ) as db_file:
-            self.db = yaml.load(db_file)
+            self.db = yaml.safe_load(db_file)
         # A map mapping package id to its tuples - this map can be used after the retrieve
         # transitive_dependencies_python call which fills this dict.
         self._id_map = {}
@@ -41,7 +41,14 @@ class MockedGraphDatabase:
     def connect(self):
         pass
 
-    def get_all_versions_python_package(self, package_name: str) -> typing.List[tuple]:
+    def get_all_versions_python_package(
+        self,
+        package_name: str,
+        os_name: str = None,
+        os_version: str = None,
+        python_version: str = None,
+        without_error: bool = True,
+    ) -> typing.List[tuple]:
         """Get all versions for the given Python package."""
         result = []
         for version, info in self.db.get(package_name, {}).items():
@@ -68,7 +75,7 @@ class MockedGraphDatabase:
                     f"The given package {package_name!r} is not present in the database"
                 )
 
-            info_entry = self.db[package_name].get(version)
+            info_entry = self.db[package_name].get(package_version)
             if not info_entry:
                 raise ValueError(
                     f"The given package {package_name!r} has no record in the database for version {version!r}"
@@ -105,7 +112,7 @@ class MockedGraphDatabase:
                             self._id_map[destination_id] = destination
                             self._reverse_id_map[destination] = destination_id
 
-                        result.append((source_id, destination_id))
+                        result.append((source_id, False, destination_id))
 
         return result
 

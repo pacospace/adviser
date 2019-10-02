@@ -28,13 +28,12 @@ import json
 
 from amun import inspect as amun_inspect
 
+from thoth.adviser.enums import DecisionType
 from thoth.python import Project
-from thoth.adviser.python import DependencyGraph
-from thoth.adviser.python.helpers import fill_package_digests_from_graph
-from thoth.common import RuntimeEnvironment
 from thoth.storages import GraphDatabase
 
-from .decision import DecisionFunction
+from .builder import PipelineBuilder
+from .pipeline import Pipeline
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,24 +80,37 @@ def _dm_stdout_output(generated_project: Project, count: int):
 def _do_dependency_monkey(
     project: Project,
     graph: GraphDatabase,
-    runtime_environment: RuntimeEnvironment,
     *,
     output_function: typing.Callable,
-    decision_function: typing.Callable,
+    decision_type: DecisionType,
     count: int = None,
     dry_run: bool = False,
+    limit_latest_versions: int = None,
+    library_usage: dict = None,
 ) -> dict:
     """Run dependency monkey."""
-    dependency_graph = DependencyGraph.from_project(graph, project, runtime_environment, restrict_indexes=True)
+    builder = PipelineBuilder(graph, project, library_usage)
+    pipeline_config = builder.get_dependency_monkey_pipeline_config(
+        decision_type, limit_latest_versions=limit_latest_versions
+    )
+    pipeline = Pipeline(
+        steps=pipeline_config.steps,
+        strides=pipeline_config.strides,
+        graph=graph,
+        project=project,
+    )
 
     computed = 0
     result = {"output": [], "computed": 0}
-    for _, generated_project in dependency_graph.walk(decision_function):
+    # The limit and count arguments propagated down to pipeline are set
+    # to the same number as in case of dependency monkey we do not care how
+    # many stacks are discarded - we want all which went through the pipeline.
+    for pipeline_product in pipeline.conduct(count=count, limit=count):
         computed += 1
-        generated_project = fill_package_digests_from_graph(generated_project, graph)
+        pipeline_product.finalize()
 
         if not dry_run:
-            entry = output_function(generated_project, count=computed)
+            entry = output_function(pipeline_product.project, count=computed)
             if entry:
                 result["output"].append(entry)
 
@@ -106,6 +118,7 @@ def _do_dependency_monkey(
             break
 
     result["computed"] = computed
+    result["stack_info"] = pipeline.get_stack_info()
     return result
 
 
@@ -114,36 +127,34 @@ def dependency_monkey(
     output: str = None,
     *,
     seed: int = None,
-    decision_function_name: str = None,
+    decision_type: DecisionType = DecisionType.ALL,
     dry_run: bool = False,
     context: str = None,
     count: int = None,
-    runtime_environment: RuntimeEnvironment = None,
+    limit_latest_versions: int = None,
+    library_usage: dict = None,
 ) -> dict:
     """Run Dependency Monkey on the given stack.
 
     @param project: a Python project to be used for generating software stacks (lockfile is not needed)
     @param output: output (Amun API, directory or '-' for stdout) where stacks should be written to
     @param seed: a seed to be used in case of random stack generation
-    @param decision_function_name: decision function to be used
+    @param decision_type: decision to be used when filtering out undesired stacks
     @param dry_run: do not perform actual writing to output, just run the dependency monkey report back computed stacks
     @param context: context to be sent to Amun, if output is set to be Amun
-    @param runtime_environment: targeted runtime environment used in dependency monkey runs
     @param count: generate upto N stacks
+    @param limit_latest_versions: number of latest versions considered for each package when generation is done
+    @library_usage: library usage to supply additional configuration in stack generation pipeline
     """
     output = output or "-"  # Default to stdout if no output was provided.
 
     graph = GraphDatabase()
     graph.connect()
 
-    decision_function = DecisionFunction.get_decision_function(
-        graph, decision_function_name, runtime_environment
-    )
     random.seed(seed)
 
     if count is not None and (count <= 0):
-        _LOGGER.error("Number of stacks has to be a positive integer")
-        return 3
+        raise ValueError("Number of stacks has to be a positive integer")
 
     if output.startswith(("https://", "http://")):
         # Submitting to Amun
@@ -153,11 +164,10 @@ def dependency_monkey(
             try:
                 context = json.loads(context)
             except Exception as exc:
-                _LOGGER.error(
+                raise ValueError(
                     "Failed to load Amun context that should be passed with generated stacks: %s",
                     str(exc),
                 )
-                return 1
         else:
             context = {}
             _LOGGER.warning("Context to Amun API is empty")
@@ -169,10 +179,9 @@ def dependency_monkey(
     else:
         _LOGGER.info("Stacks will be written to %r", output)
         if context:
-            _LOGGER.error(
+            raise ValueError(
                 "Unable to use context when writing generated projects onto filesystem"
             )
-            return 2
 
         if not os.path.isdir(output):
             os.makedirs(output, exist_ok=True)
@@ -182,9 +191,10 @@ def dependency_monkey(
     return _do_dependency_monkey(
         project,
         graph=graph,
-        runtime_environment=runtime_environment,
         dry_run=dry_run,
-        decision_function=decision_function,
+        decision_type=decision_type,
         count=count,
         output_function=output_function,
+        limit_latest_versions=limit_latest_versions,
+        library_usage=library_usage,
     )

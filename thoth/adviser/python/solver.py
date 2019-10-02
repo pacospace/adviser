@@ -23,7 +23,6 @@ no need to perform resolving by actually installing Python packages (as this
 version resolution is dynamic in case of Python).
 """
 
-import re
 import typing
 
 from thoth.common import RuntimeEnvironment
@@ -43,13 +42,15 @@ class GraphReleasesFetcher(ReleasesFetcher):
         """Initialize graph release fetcher."""
         super().__init__()
         self._graph_db = graph_db
-        self.runtime_environment = runtime_environment or RuntimeEnvironment.from_dict({})
+        self.runtime_environment = runtime_environment or RuntimeEnvironment.from_dict(
+            {}
+        )
 
     @property
     def graph_db(self):
         """Get instance of graph database adapter, lazily."""
         # Place the import statement here to simplify mocks in the testsuite.
-        from thoth.storages.graph.janusgraph import GraphDatabase
+        from thoth.storages import GraphDatabase
 
         if not self._graph_db:
             self._graph_db = GraphDatabase()
@@ -67,7 +68,6 @@ class GraphReleasesFetcher(ReleasesFetcher):
             os_name=self.runtime_environment.operating_system.name,
             os_version=self.runtime_environment.operating_system.version,
             python_version=self.runtime_environment.python_version,
-            without_error=True,
         )
         return package_name, result
 
@@ -89,12 +89,19 @@ class PythonGraphSolver(Solver):
     """Solve Python dependencies based on data available in the graph database."""
 
     def __init__(
-        self, *, parser_kwargs: dict = None, graph_db=None, runtime_environment=None, solver_kwargs: dict = None
+        self,
+        *,
+        parser_kwargs: dict = None,
+        graph_db=None,
+        runtime_environment=None,
+        solver_kwargs: dict = None,
     ):
         """Initialize instance."""
         super().__init__(
             PackageVersionDependencyParser(**(parser_kwargs or {})),
-            GraphReleasesFetcher(graph_db=graph_db, runtime_environment=runtime_environment),
+            GraphReleasesFetcher(
+                graph_db=graph_db, runtime_environment=runtime_environment
+            ),
             **(solver_kwargs or {}),
         )
 
@@ -115,8 +122,12 @@ class PythonPackageGraphSolver:
             parser_kwargs=parser_kwargs,
             graph_db=graph_db,
             solver_kwargs=solver_kwargs,
-            runtime_environment=runtime_environment
+            runtime_environment=runtime_environment,
         )
+        # Do not instantiate multiple objects for same python package tuple to optimize memory usage.
+        self._package_versions = {}
+        # Have just one instance of Source object per python package source index url.
+        self._sources = {}
 
     def solve(
         self,
@@ -153,12 +164,22 @@ class PythonPackageGraphSolver:
                 list(resolved.values())[0] if all_versions else resolved.values()
             ):
                 # We only change version attribute that will be the resolved one.
-                package_version = PackageVersion(
-                    name=dependencies[0].name,
-                    version='==' + version,
-                    index=Source(index_url),
-                    develop=dependencies[0].develop,
-                )
+                package_tuple = (dependencies[0].name, version, index_url)
+                package_version = self._package_versions.get(package_tuple)
+                if not package_version:
+                    source = self._sources.get(index_url)
+                    if not source:
+                        source = Source(index_url)
+                        self._sources[index_url] = source
+
+                    package_version = PackageVersion(
+                        name=dependencies[0].name,
+                        version="==" + version,
+                        index=source,
+                        develop=dependencies[0].develop,
+                    )
+                    self._package_versions[package_tuple] = package_version
+
                 if all_versions:
                     result[package_version.name].append(package_version)
                 else:
@@ -180,14 +201,23 @@ class PythonPackageGraphSolver:
                 original_package = dependencies_map.pop(package_name)
                 result_versions = []
                 for version, index_url in versions if all_versions else [versions]:
-                    result_versions.append(
-                        PackageVersion(
+                    package_tuple = (original_package.name, version, index_url)
+                    package_version = self._package_versions.get(package_tuple)
+                    if not package_version:
+                        source = self._sources.get(index_url)
+                        if not source:
+                            source = Source(index_url)
+                            self._sources[index_url] = source
+
+                        package_version = PackageVersion(
                             name=original_package.name,
-                            version='==' + version,
-                            index=Source(index_url),
+                            version="==" + version,
+                            index=source,
                             develop=original_package.develop,
                         )
-                    )
+
+                    result_versions.append(package_version)
+
                 result[original_package.name] = result_versions
 
         return result

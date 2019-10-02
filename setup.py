@@ -6,7 +6,6 @@ from setuptools.command.test import test as TestCommand
 
 def get_install_requires():
     with open('requirements.txt', 'r') as requirements_file:
-        # TODO: respect hashes in requirements.txt file
         res = requirements_file.readlines()
         return [req.split(' ', maxsplit=1)[0] for req in res if req]
 
@@ -27,13 +26,17 @@ def read(fname):
 
 
 class Test(TestCommand):
+    """Introduce test command to run testsuite using pytest."""
+
+    _IMPLICIT_PYTEST_ARGS = ['tests/', '--timeout=2', '--cov=./thoth', '--capture=no', '--verbose', '-l', '-s', '-vv']
+
     user_options = [
         ('pytest-args=', 'a', "Arguments to pass into py.test")
     ]
 
     def initialize_options(self):
         super().initialize_options()
-        self.pytest_args = ['tests/', '--timeout=2', '--cov=./thoth', '--capture=no', '--verbose', '-l', '-s']
+        self.pytest_args = None
 
     def finalize_options(self):
         super().finalize_options()
@@ -42,22 +45,46 @@ class Test(TestCommand):
 
     def run_tests(self):
         import pytest
-        sys.exit(pytest.main(self.pytest_args))
+        passed_args = list(self._IMPLICIT_PYTEST_ARGS)
+
+        if self.pytest_args:
+            self.pytest_args = [arg for arg in self.pytest_args.split() if arg]
+            passed_args.extend(self.pytest_args)
+
+        sys.exit(pytest.main(passed_args))
 
 
+VERSION = get_version()
 setup(
     name='thoth-adviser',
-    version=get_version(),
+    version=VERSION,
     description='Package and package stack adviser for the Thoth project',
     long_description=read('README.rst'),
     author='Fridolin Pokorny',
     author_email='fridolin@redhat.com',
     license='GPLv3+',
-    packages=['thoth.adviser', 'thoth.adviser.python'],
+    packages=[
+        'thoth.adviser',
+        'thoth.adviser.python',
+        'thoth.adviser.python.pipeline',
+        'thoth.adviser.python.dependency_graph',
+        'thoth.adviser.python.pipeline.steps',
+        'thoth.adviser.python.pipeline.units',
+        'thoth.adviser.python.pipeline.sieves',
+        'thoth.adviser.python.pipeline.strides',
+        'thoth.adviser.python.dependency_graph.walking',
+        'thoth.adviser.python.dependency_graph.adaptation',
+    ],
     entry_points={
         'console_scripts': ['thoth-adviser=thoth.adviser.cli:cli']
     },
     zip_safe=False,
     install_requires=get_install_requires(),
     cmdclass={'test': Test},
+    command_options={
+        'build_sphinx': {
+            'version': ('setup.py', VERSION),
+            'release': ('setup.py', VERSION),
+        }
+    }
 )
